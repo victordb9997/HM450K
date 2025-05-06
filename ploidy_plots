@@ -1,0 +1,633 @@
+setwd("C:/Users/victo/Documents")
+
+input_dir  <- "output"                
+plot_dir   <- "output_ploidy"         
+if (!dir.exists(plot_dir)) dir.create(plot_dir, recursive = TRUE)
+summary_tsv <- file.path(plot_dir, "mm_cutpoints.tsv")
+
+
+mm_plot_width_in <- 10     
+mm_plot_height_in <- 10    
+mm_plot_res_dpi <- 150    
+
+suppressPackageStartupMessages({
+  library(data.table)
+  library(ggplot2)
+  library(patchwork)
+  library(MASS)
+  library(mixtools)
+})
+
+count_label <- function(dt, tumour){
+  # Custom label formatting for plot annotations, differs by tumour group.
+  if (tumour %in% c("BRCA","HNSC","LUAD","LUSC")) {
+    cnt <- table(dt$Mutation_Load_Group)
+    cnt <- cnt[cnt > 0]
+    return(paste(names(cnt), cnt, sep=": n=", collapse="   "))
+  } else {
+    cnt <- table(dt$Ploidy_Cluster_MM, dt$Mutation_Load_Group)
+    lines <- apply(cnt, 1, function(x){
+               if (sum(x)==0) return(NULL)
+               paste0(names(which.max(x)), ": ", sum(x)) # Label by dominant group if not BRCA/HNSC/etc.
+             })
+    lines <- lines[!sapply(lines, is.null)]
+    return(paste(lines, collapse="   "))
+  }
+}
+
+
+if (file.exists("misc/multiModal.R")) {
+    source("misc/multiModal.R", local = TRUE) # Core mixture modeling logic.
+} else {
+    warning("misc/multiModal.R not found. Using a placeholder function. MM fitting will likely fail.")
+    multiModal <- function(x, ...) {
+        warning("Placeholder multiModal function called.")
+         list(
+            fit1 = list(loglik = tryCatch(sum(dnorm(x, mean(x, na.rm=TRUE), sd(x, na.rm=TRUE), log=TRUE)), error=function(e) NA)),
+            fit2 = NULL,
+            fit3 = NULL,
+            t2 = NULL,
+            t3 = NULL
+        )
+    }
+}
+
+
+.separated_enough <- function(mu, sigma, min_d){
+  # Helper: check if mixture components are 'distinct' enough.
+  if(length(mu) < 2) return(TRUE) 
+  mu <- sort(mu)
+  sigma_finite <- sigma[is.finite(sigma) & sigma > 1e-9]
+  if(length(sigma_finite) < length(sigma) || length(mu) != length(sigma)) return(FALSE) 
+  if(length(sigma_finite) == 0) return(FALSE) 
+
+  pooled_sd <- sqrt(mean(sigma_finite^2))
+  if (!is.finite(pooled_sd) || pooled_sd < 1e-9) return(FALSE) 
+
+  all(diff(mu) / pooled_sd >= min_d)
+}
+
+
+choose_best <- function(mm, p_cut = 0.05,
+                         min_lambda = 0.00001, min_d = 1){
+  # Selects optimal k (1, 2, or 3 components) for mixture model.
+  # Uses LRT (p_cut) and component separation (min_d, min_lambda).
+  ll <- c(mm$fit1$loglik, mm$fit2$loglik, mm$fit3$loglik)
+
+  p21 <- 1 - pchisq(2 * (ll[2] - ll[1]), df = 3)   
+  p32 <- 1 - pchisq(2 * (ll[3] - ll[2]), df = 3)   
+
+  k <- 1;  thr <- NULL
+  if (!is.na(p21) && p21 < p_cut &&
+      .separated_enough(mm$fit2$mu, mm$fit2$sigma, min_d) &&
+      all(mm$fit2$lambda >= min_lambda)){
+        k   <- 2
+        thr <- mm$t2
+  }
+  if (k == 2 && !is.na(p32) && p32 < p_cut &&
+      .separated_enough(mm$fit3$mu, mm$fit3$sigma, min_d) &&
+      sum(mm$fit3$lambda >= min_lambda) >= 2){ # Need at least 2 components to be substantial for k=3
+        k   <- 3
+        thr <- sort(mm$t3)
+  }
+  list(k = k, thr = thr)
+}
+
+add_cluster <- function(dt, var, best, out){
+  # Assigns cluster labels (G1, G2, G3) based on chosen k and thresholds.
+  if (!var %in% names(dt)) {
+      warning("Variable '", var, "' not found in data.table. Cannot assign clusters.")
+      dt[[out]] <- factor("Unknown", levels=c("G1", "G2", "G3", "Unknown")) 
+      return(dt)
+  }
+
+  cluster_levels <- c("G1", "G2", "G3", "Unknown")
+
+  dt[[out]] <- factor("Unknown", levels = cluster_levels)
+
+  valid_data_idx <- which(is.finite(dt[[var]])) 
+  if(length(valid_data_idx) == 0) {
+      warning("No finite data found for variable '", var, "'. No clusters assigned (all Unknown).")
+      return(dt) 
+  }
+
+  data_values <- dt[[var]][valid_data_idx]
+  assigned_clusters <- rep("Unknown", length(data_values)) 
+
+  if (best$k == 1) {
+    assigned_clusters <- "G1" 
+  } else if (best$k == 2 && !is.null(best$thr) && length(best$thr) == 1 && is.finite(best$thr)) {
+    assigned_clusters <- ifelse(data_values <= best$thr, "G1", "G2")
+  } else if (best$k == 3 && !is.null(best$thr) && length(best$thr) == 2 && all(is.finite(best$thr))) {
+    t <- sort(best$thr) 
+    assigned_clusters <- fifelse(data_values <= t[1], "G1",
+                        fifelse(data_values <= t[2], "G2", "G3"))
+  } else if (best$k > 1) {
+      warning("Inconsistent state: k=", best$k, " but thresholds invalid/missing (thr=", paste(best$thr, collapse=","), "). Assigning G1 to all valid data.")
+      assigned_clusters <- "G1"
+  }
+
+  dt[[out]][valid_data_idx] <- factor(assigned_clusters, levels = cluster_levels)
+
+  dt[[out]] <- factor(dt[[out]], levels = cluster_levels)
+
+  return(dt)
+}
+
+
+mm_save_png <- function(x, file, width_in = 8, height_in = 3, res_dpi = 150){
+  # Wrapper to call multiModal and save its plot output.
+  x_finite <- x[is.finite(x)]
+  if (length(x_finite) < 10 || sd(x_finite, na.rm = TRUE) < 1e-6) { 
+      warning("Insufficient data (<10) or near-zero variance for plotting mixture model: ", basename(file))
+      message("  Skipping MM plot due to insufficient data/variance: ", basename(file))
+      return(invisible(NULL)) 
+  }
+  if (!exists("multiModal", mode = "function")) {
+      stop("multiModal function not found. Ensure misc/multiModal.R is sourced correctly.")
+  }
+  env <- environment(multiModal)
+  if (!is.null(env)) { 
+       data_range <- range(x_finite, na.rm = TRUE)
+       if (all(is.finite(data_range)) && diff(data_range) > 1e-9) {
+          # .ann_x is likely used internally by multiModal for plot annotation placement
+          assign(".ann_x", data_range[1] + 0.05 * diff(data_range), envir = env)
+       } else {
+          assign(".ann_x", data_range[1], envir = env) 
+       }
+  } else {
+      warning("Could not access environment of multiModal function.")
+  }
+
+  png_success <- tryCatch({
+      png(file, width = width_in, height = height_in, units = "in", res = res_dpi)
+      multiModal_result <- multiModal(x_finite) # Actual call to plotting
+      dev.off()
+      TRUE 
+  }, error = function(e) {
+      warning("Failed to create PNG file '", file, "'. Error: ", e$message)
+      if (names(dev.cur()) == "png" && dev.cur() != 1) dev.off() 
+      return(FALSE) 
+  })
+  if (!png_success) {
+     # Minimal error handling for failed PNG (e.g., cleanup small/empty files)
+     if (file.exists(file) && file.info(file)$size < 100) {
+         
+     }
+  }
+}
+
+
+set_hyper_group <- function(dt){
+  # Defines "Hypermutated" vs "NonHypermutated" based on Nmut_Cluster_MM.
+  # The cluster with highest mean log10Nmut is considered "Hypermutated".
+  group_levels <- c("Hypermutated", "NonHypermutated", "Unknown")
+
+  if (!"Nmut_Cluster_MM" %in% names(dt)){
+    warning("Column 'Nmut_Cluster_MM' not found. Cannot assign Mutation_Load_Group.")
+    dt[, Mutation_Load_Group := factor("Unknown", levels=group_levels)]
+    return(dt)
+  }
+   if (!"log10Nmut" %in% names(dt)){
+    warning("Column 'log10Nmut' not found. Cannot determine hypermutated group.")
+    dt[, Mutation_Load_Group := factor("Unknown", levels=group_levels)]
+    return(dt)
+  }
+
+  dt[, Mutation_Load_Group := factor("Unknown", levels=group_levels)]
+
+  means <- dt[Nmut_Cluster_MM != "Unknown" & is.finite(log10Nmut),
+              .(m = mean(log10Nmut, na.rm = TRUE)),
+              by = Nmut_Cluster_MM][is.finite(m)] 
+
+  if (nrow(means) > 0) {
+    hyper_cluster <- means[order(-m), Nmut_Cluster_MM][1]
+
+    dt[Nmut_Cluster_MM != "Unknown", Mutation_Load_Group := factor(
+         ifelse(Nmut_Cluster_MM == hyper_cluster, "Hypermutated", "NonHypermutated"),
+         levels=group_levels
+       )]
+  } else {
+     warning("Could not determine hypermutated group (no valid clusters with finite log10Nmut data). All remain 'Unknown'.")
+  }
+  dt[, Mutation_Load_Group := factor(Mutation_Load_Group, levels = group_levels)]
+  dt
+}
+
+
+make_panel <- function(dt, p_thr=NULL, m_thr=NULL, tumour, stat_lbl=NULL){
+  # Generates composite plot: scatter + marginal histograms for Ploidy vs log10Nmut.
+  pd <- dt[is.finite(Ploidy) & is.finite(log10Nmut)]
+  if (nrow(pd) < 10) {
+      message("  Skipping panel plot for ", tumour, " (N=", nrow(pd), ", requires >=10)")
+      return(NULL)
+  }
+
+  # Specific tumor types (BRCA, etc.) get regression line; others colored by Mutation_Load_Group.
+  show_regression <- tumour %in% c("BRCA", "HNSC", "LUAD", "LUSC")
+  point_colors <- NULL 
+  legend_setting <- theme(legend.position = "bottom")
+  color_scale <- NULL
+
+  if (show_regression) {
+      point_aes <- aes(Ploidy, log10Nmut) 
+      point_geom <- geom_point(colour = "black", alpha = 0.6, na.rm = TRUE)
+      legend_setting <- theme(legend.position = "none")
+  } else {
+      point_aes <- aes(Ploidy, log10Nmut, colour = Mutation_Load_Group)
+      point_geom <- geom_point(alpha = 0.6, na.rm = TRUE)
+      point_colors <- c(Hypermutated = "red", NonHypermutated = "blue", Unknown = "grey70")
+      color_scale <- scale_colour_manual(name = "Mutation Load",
+                                         values = point_colors,
+                                         labels = c(Hypermutated="Hypermutated", NonHypermutated="Non-Hypermutated", Unknown="Unknown"),
+                                         drop = FALSE) 
+  }
+
+  g_sc <- ggplot(pd, point_aes) +
+    point_geom + 
+    theme_bw() +
+    xlab("Ploidy") +
+    ylab("log10(Nmut+1)") +
+    legend_setting 
+
+  if (!is.null(color_scale)) {
+    g_sc <- g_sc + color_scale
+  }
+
+  if (show_regression) {
+    if (nrow(pd) >= 3 && sd(pd$Ploidy, na.rm=TRUE) > 1e-6 && sd(pd$log10Nmut, na.rm=TRUE) > 1e-6) {
+      g_sc <- g_sc + geom_smooth(method = "lm", se = TRUE, color = "black", lty = 1, linewidth = 0.8, formula = y ~ x, na.rm = TRUE)
+    }
+  }
+
+  if (!is.null(p_thr) && is.numeric(p_thr) && all(is.finite(p_thr))) { 
+      g_sc <- g_sc + geom_vline(xintercept = p_thr, lty = 2, col = "darkblue")
+  }
+  if (!is.null(m_thr) && is.numeric(m_thr) && all(is.finite(m_thr))) { 
+      g_sc <- g_sc + geom_hline(yintercept = m_thr, lty = 2, col = "darkred")
+  }
+   
+  # Annotate quadrants with N counts.
+  xbreaks <- sort(c(-Inf, p_thr,  Inf))          
+  ybreaks <- sort(c(-Inf, m_thr,  Inf))          
+
+  pd[, xbin := cut(Ploidy,      xbreaks, include.lowest = TRUE, labels = FALSE)]
+  pd[, ybin := cut(log10Nmut,   ybreaks, include.lowest = TRUE, labels = FALSE)]
+
+  cnt <- pd[, .N, by = .(xbin, ybin)]            
+
+  midpt <- function(brks, idx, data_vec, shift_factor = 0.8) { # Helper to find annotation coords.
+  lo <- brks[idx]
+  hi <- brks[idx + 1]
+  if (is.infinite(lo)) lo <- min(data_vec, na.rm = TRUE)
+  if (is.infinite(hi)) hi <- max(data_vec, na.rm = TRUE)
+  
+  lo + (hi - lo) * shift_factor # Shift to avoid edges
+  }
+
+
+  for (i in seq_len(nrow(cnt))) {
+    xc <- midpt(xbreaks, cnt$xbin[i], pd$Ploidy)
+    yc <- midpt(ybreaks, cnt$ybin[i], pd$log10Nmut)
+
+    g_sc <- g_sc +
+            annotate("text", x = xc, y = yc,
+                    label = paste0("n=", cnt$N[i]),
+                    size  = 3.3, colour = "grey20")
+  }
+  
+
+  if (!is.null(stat_lbl)) {
+      g_sc <- g_sc + annotate("text", x = Inf, y = Inf, label = stat_lbl, hjust = 1.1, vjust = 1.5, size = 3.5, lineheight = 0.9)
+  }
+  # grp_lbl <- count_label(pd, tumour) # This seems to be unused or duplicated by the loop below.
+  
+  xbreaks <- if (is.null(p_thr))
+                c(-Inf,  Inf) else sort(c(-Inf, p_thr,  Inf))
+  ybreaks <- if (is.null(m_thr))
+                c(-Inf,  Inf) else sort(c(-Inf, m_thr, Inf))
+
+  pd[, xbin := cut(Ploidy,       breaks = xbreaks, include.lowest = TRUE)]
+  pd[, ybin := cut(log10Nmut,    breaks = ybreaks, include.lowest = TRUE)]
+
+  cnt <- pd[, .N, by = .(xbin, ybin)]
+
+  # This loop seems to re-annotate counts, potentially overwriting or adding to the previous.
+  # The logic for midpt and annotation is similar.
+  for (i in seq_len(nrow(cnt))) {
+    xc <- midpt(xbreaks, as.integer(cnt$xbin[i]), pd$Ploidy)
+    yc <- midpt(ybreaks, as.integer(cnt$ybin[i]), pd$log10Nmut)
+
+    g_sc <- g_sc +
+      annotate("text",
+              x = xc, y = yc,
+              label = paste0("n=", cnt$N[i]),
+              size = 3, colour = "black")
+  }
+  
+
+  rng_x <- range(pd$Ploidy, na.rm=TRUE); bw_x <- diff(rng_x) / 40
+  if(!is.finite(bw_x) || bw_x <= 1e-6) bw_x <- max(0.01, diff(rng_x)/100) 
+  g_top <- ggplot(pd, aes(Ploidy)) +
+    geom_histogram(binwidth = bw_x, fill = "skyblue", boundary = rng_x[1], na.rm = TRUE) +
+    geom_density(aes(y = after_stat(count * bw_x)), col = "blue", na.rm = TRUE) +
+    theme_bw() +
+    theme(axis.text.x = element_blank(), axis.ticks.x = element_blank(), axis.title.x = element_blank(),
+          plot.margin = margin(t = 5, r = 0, b = 0, l = 5)) + 
+    ylab("Count")
+  if (!is.null(p_thr) && is.numeric(p_thr) && all(is.finite(p_thr))) { 
+      g_top <- g_top + geom_vline(xintercept = p_thr, lty = 2, col = "darkblue")
+  }
+  if(all(is.finite(rng_x))) g_top <- g_top + scale_x_continuous(limits = rng_x)
+
+
+  rng_y <- range(pd$log10Nmut, na.rm=TRUE); bw_y <- diff(rng_y) / 40
+  if(!is.finite(bw_y) || bw_y <= 1e-6) bw_y <- max(0.01, diff(rng_y)/100) 
+  g_r <- ggplot(pd, aes(log10Nmut)) +
+    geom_histogram(aes(y = after_stat(count)), binwidth = bw_y, fill = "mistyrose", boundary = rng_y[1], na.rm = TRUE) +
+    geom_density(aes(y = after_stat(count * bw_y)), col = "red", na.rm = TRUE) +
+          
+    coord_flip() +  
+      
+    { if (!is.null(m_thr) && is.numeric(m_thr) && all(is.finite(m_thr)))
+          geom_vline(xintercept = m_thr, lty = 2, col = "darkred")
+    } +
+  
+    theme_bw() +
+    theme(axis.text.y = element_blank(), axis.ticks.y = element_blank(), axis.title.y = element_blank(),
+          plot.margin = margin(t = 0, r = 5, b = 5, l = 0)) + 
+    ylab(paste0("Count")) 
+
+  
+   if(all(is.finite(rng_y))) g_r <- g_r + scale_x_continuous(limits = rng_y) 
+
+
+  # Patchwork assembles the final plot.
+  plot_layout_obj <- tryCatch({
+      (g_top + patchwork::plot_spacer() + g_sc + g_r) +
+          plot_layout(ncol = 2, nrow = 2, widths = c(4, 1), heights = c(1, 4))
+  }, error = function(e) {
+       warning("Error creating patchwork layout for ", tumour, ": ", e$message)
+       return(NULL)
+  })
+
+  if(is.null(plot_layout_obj)) return(NULL) 
+
+  final_plot <- plot_layout_obj + plot_annotation(title = sprintf("%s : Ploidy vs log10(Nmut+1)", tumour))
+
+  return(final_plot)
+}
+
+
+pt_files <- dir(input_dir, pattern = "_patient_table\\.rds$", full.names = TRUE)
+if (!length(pt_files)) stop("No *_patient_table.rds found in ", input_dir)
+
+cut_list <- list() # To store MM cut-points from each tumor type.
+for (f in pt_files) {
+  tumour <- sub("_patient_table\\.rds$", "", basename(f)); message("◼ ", tumour)
+  dt <- readRDS(f); setDT(dt)
+
+  # Ensure log10Nmut and Ploidy columns exist and are numeric.
+  if (!"log10Nmut" %in% names(dt)) {
+      if ("Nmut" %in% names(dt)) {
+          message("  Calculating log10Nmut = log10(Nmut+1)")
+          dt[, Nmut := as.numeric(as.character(Nmut))] 
+          dt[, log10Nmut := ifelse(is.finite(Nmut), log10(Nmut + 1), NA_real_)]
+      } else {
+          warning("  Column 'Nmut' not found in ", tumour, ". Cannot calculate log10Nmut.")
+          dt[, log10Nmut := NA_real_] 
+      }
+  } else {
+       dt[, log10Nmut := as.numeric(as.character(log10Nmut))]
+  }
+  if ("Ploidy" %in% names(dt)) {
+      dt[, Ploidy := as.numeric(as.character(Ploidy))] 
+  } else {
+      warning(" Column 'Ploidy' not found in ", tumour, ".")
+      dt[, Ploidy := NA_real_]
+  }
+
+  # --- Ploidy Mixture Modeling ---
+  bp <- list(k = 1, thr = NULL) # Best ploidy model defaults
+  if ("Ploidy" %in% names(dt) && dt[, sum(is.finite(Ploidy))] >= 10) {
+    pl <- dt$Ploidy[is.finite(dt$Ploidy)] 
+    mm_pl <- NULL 
+    if (sd(pl, na.rm = TRUE) > 1e-6) { # Check for non-zero variance
+        mm_pl <- tryCatch(multiModal(pl), error = function(e) {
+            warning("multiModal failed for Ploidy in ", tumour, ": ", e$message); NULL
+        })
+    } else {
+        message("  Skipping Ploidy MM fitting for ", tumour, " due to near-zero variance.")
+    }
+
+    if (!is.null(mm_pl)) {
+        mm_save_png(pl, file.path(plot_dir, sprintf("%s_ploidy_mm.png", tumour)),
+                    width_in = mm_plot_width_in, height_in = mm_plot_height_in, res_dpi = mm_plot_res_dpi)
+        bp <- choose_best(mm_pl)
+
+        thr_string_pl <- "NA"
+        if (!is.null(bp$thr) && is.numeric(bp$thr) && all(is.finite(bp$thr))) {
+            thr_string_pl <- paste(round(bp$thr, 3), collapse = ",")
+        } else if (!is.null(bp$thr)) {
+             warning(sprintf("Non-numeric or non-finite threshold detected for Ploidy MM in %s: %s. Assigning NA.", tumour, paste(bp$thr, collapse=",")))
+        }
+        message(sprintf("  Ploidy MM for %s: Chosen k=%d, Threshold(s)=%s", tumour, bp$k, thr_string_pl))
+
+        dt <- add_cluster(dt, "Ploidy", bp, "Ploidy_Cluster_MM")
+
+        cut_value_pl <- NA_character_
+        if (!is.null(bp$thr) && is.numeric(bp$thr) && all(is.finite(bp$thr))) {
+             cut_value_pl <- paste(round(bp$thr, 3), collapse = ",")
+        }
+        cut_list[[length(cut_list) + 1]] <- data.table(tumour, variable = "Ploidy", k = bp$k, cut = cut_value_pl)
+
+    } else {
+        message("  Could not fit Ploidy MM for ", tumour, ". Assigning default G1 cluster.")
+        if (!"Ploidy_Cluster_MM" %in% names(dt)) dt[, Ploidy_Cluster_MM := factor("G1", levels=c("G1", "G2", "G3", "Unknown"))]
+        cut_list[[length(cut_list) + 1]] <- data.table(tumour, variable = "Ploidy", k = 1, cut = NA_character_)
+    }
+  } else {
+     message("  Skipping Ploidy MM for ", tumour, ": requires >= 10 finite values.")
+     if (!"Ploidy_Cluster_MM" %in% names(dt)) dt[, Ploidy_Cluster_MM := factor("G1", levels=c("G1", "G2", "G3", "Unknown"))]
+     cut_list[[length(cut_list) + 1]] <- data.table(tumour, variable = "Ploidy", k = 1, cut = NA_character_)
+  }
+
+  # --- Mutation Load (log10Nmut) Mixture Modeling ---
+  bm <- list(k = 1, thr = NULL) # Best mutational load model defaults
+  if ("log10Nmut" %in% names(dt) && dt[, sum(is.finite(log10Nmut))] >= 10) {
+    mv <- dt$log10Nmut[is.finite(dt$log10Nmut)] 
+    mm_m <- NULL 
+    if (sd(mv, na.rm = TRUE) > 1e-6) { # Check for non-zero variance
+        mm_m <- tryCatch(multiModal(mv), error = function(e) {
+            warning("multiModal failed for log10Nmut in ", tumour,": ", e$message); NULL
+        })
+    } else {
+        message("  Skipping MutLoad MM fitting for ", tumour, " due to near-zero variance.")
+    }
+
+    if (!is.null(mm_m)) {
+        mm_save_png(mv, file.path(plot_dir, sprintf("%s_mutload_mm.png", tumour)),
+                    width_in = mm_plot_width_in, height_in = mm_plot_height_in, res_dpi = mm_plot_res_dpi)
+        # bm <- choose_best(mm_m) # This line was here, then replaced by specific logic for READ.
+
+        thr_string_mut <- "NA" 
+        if (!is.null(bm$thr) && is.numeric(bm$thr) && all(is.finite(bm$thr))) {
+            # This part seems to use bm$thr before bm is potentially re-assigned for READ.
+            # It might be better to move message after bm is finalized.
+            thr_string_mut <- paste(round(bm$thr, 3), collapse = ",")
+        } else if (!is.null(bm$thr)) {
+            thr_string_raw <- paste(bm$thr, collapse=",") 
+            warning(sprintf("Non-numeric or non-finite threshold detected for MutLoad MM in %s: %s. Assigning NA.", tumour, thr_string_raw))
+        }
+        # Message moved down to after READ-specific adjustment.
+         
+
+        if (tumour == "READ") { # Special MM parameters for READ.
+            bm <- choose_best(mm_m,
+                              p_cut      = 0.05,
+                              min_lambda = 1e-6,
+                              min_d      = 0.0005)
+        } else {
+            bm <- choose_best(mm_m)       
+        }
+        
+        # Now log the chosen k and thresholds after any specific adjustments.
+        thr_string_mut_final <- "NA"
+        if (!is.null(bm$thr) && is.numeric(bm$thr) && all(is.finite(bm$thr))) {
+            thr_string_mut_final <- paste(round(bm$thr, 3), collapse = ",")
+        }
+        message(sprintf("  MutLoad MM for %s: Chosen k=%d, Threshold(s)=%s", tumour, bm$k, thr_string_mut_final))
+
+
+        dt <- add_cluster(dt, "log10Nmut", bm, "Nmut_Cluster_MM")
+
+        cut_value_mut <- NA_character_ 
+        if (!is.null(bm$thr) && is.numeric(bm$thr) && all(is.finite(bm$thr))) {
+             cut_value_mut <- paste(round(bm$thr, 3), collapse = ",")
+        }
+        cut_list[[length(cut_list) + 1]] <- data.table(tumour, variable = "log10Nmut", k = bm$k, cut = cut_value_mut)
+        
+
+    } else {
+        message("  Could not fit MutLoad MM for ", tumour, ". Assigning default G1 cluster.")
+        if (!"Nmut_Cluster_MM" %in% names(dt)) dt[, Nmut_Cluster_MM := factor("G1", levels=c("G1", "G2", "G3", "Unknown"))] 
+        cut_list[[length(cut_list) + 1]] <- data.table(tumour, variable = "log10Nmut", k = 1, cut = NA_character_) 
+    }
+  } else {
+       message("  Skipping MutLoad MM for ", tumour, ": requires >= 10 finite values.")
+       if (!"Nmut_Cluster_MM" %in% names(dt)) dt[, Nmut_Cluster_MM := factor("G1", levels=c("G1", "G2", "G3", "Unknown"))]
+       cut_list[[length(cut_list) + 1]] <- data.table(tumour, variable = "log10Nmut", k = 1, cut = NA_character_) 
+  }
+
+  if (!"Nmut_Cluster_MM" %in% names(dt)) { # Ensure Nmut_Cluster_MM exists for set_hyper_group
+      dt[, Nmut_Cluster_MM := factor("G1", levels=c("G1", "G2", "G3", "Unknown"))]
+  }
+  dt <- set_hyper_group(dt) 
+
+
+  # --- Statistics for plot annotation ---
+  stat_label <- NULL
+  if (all(c("Ploidy", "log10Nmut") %in% names(dt))) {
+      tmp <- dt[is.finite(Ploidy) & is.finite(log10Nmut)]
+      if (nrow(tmp) >= 3) { 
+          # Stat test differs for specific cancer types (lm vs. chi-squared)
+          if (tumour %in% c("BRCA", "HNSC", "LUAD","LUSC")) {
+              sd_p <- sd(tmp$Ploidy, na.rm = TRUE); sd_m <- sd(tmp$log10Nmut, na.rm = TRUE)
+              if (!is.na(sd_p) && sd_p > 1e-6 && !is.na(sd_m) && sd_m > 1e-6) {
+                  fit <- tryCatch(lm(log10Nmut ~ Ploidy, data = tmp), error = function(e) NULL)
+                  if (!is.null(fit)){
+                      lm_summary <- summary(fit)
+                      if ("Ploidy" %in% rownames(lm_summary$coefficients)) {
+                         p <- lm_summary$coefficients["Ploidy", "Pr(>|t|)"]
+                         r <- cor(tmp$Ploidy, tmp$log10Nmut, use = "complete.obs")
+                         stat_label <- sprintf("lm: r = %.2f\np = %.2g", r, p)
+                      } else {
+                          stat_label <- "lm: Coeff error" 
+                      }
+                  } else {
+                      stat_label <- "lm: Fit failed" 
+                  }
+              } else {
+                  stat_label <- "lm: Insuff. variance" 
+              }
+          } else { # For other tumor types, use Chi-squared test on cluster assignments
+              if (all(c("Ploidy_Cluster_MM", "Mutation_Load_Group") %in% names(dt))) {
+                 tbl_data <- tmp[!is.na(Ploidy_Cluster_MM) & Ploidy_Cluster_MM != "Unknown" &
+                                 !is.na(Mutation_Load_Group) & Mutation_Load_Group != "Unknown"]
+
+                 if (nrow(tbl_data) > 0){
+                     # Ensure factor levels are consistent for table
+                     tbl_data[, Ploidy_Cluster_MM := factor(Ploidy_Cluster_MM, levels = c("G1", "G2", "G3"))]
+                     tbl_data[, Mutation_Load_Group := factor(Mutation_Load_Group, levels = c("Hypermutated", "NonHypermutated"))]
+                     tbl <- table(tbl_data$Ploidy_Cluster_MM, tbl_data$Mutation_Load_Group)
+
+                     tbl <- tbl[rowSums(tbl) > 0, colSums(tbl) > 0, drop = FALSE] # Drop empty rows/cols
+
+                     if (all(dim(tbl) >= 2)) { # Chi-sq needs at least 2x2
+                        cs <- suppressWarnings(tryCatch(chisq.test(tbl), error = function(e) NULL))
+                        if (!is.null(cs)) {
+                           stat_label <- sprintf("χ²: p = %.2g", cs$p.value)
+                        } else {
+                            stat_label <- "χ²: Test error"
+                        }
+                     } else {
+                        stat_label <- "χ²: <2 non-empty groups"
+                     }
+                 } else {
+                    stat_label <- "χ²: No valid data"
+                 }
+              } else {
+                 stat_label <- "χ²: Cluster cols missing"
+              }
+          }
+      } else {
+          stat_label <- "Stats: N < 3" 
+      }
+  } else {
+       stat_label <- "Stats: Ploidy/log10Nmut missing" 
+  }
+
+  # --- Generate and save panel plot ---
+  panel_plot <- make_panel(dt, bp$thr, bm$thr, tumour, stat_label)
+
+  if (!is.null(panel_plot)) {
+    ggsave_status <- tryCatch({
+        ggsave(file.path(plot_dir, sprintf("%s_mm_panel.png", tumour)), panel_plot, width = 8, height = 7, dpi = 150, bg = "white") 
+        TRUE 
+    }, error = function(e) {
+        warning("Failed to save panel plot for ", tumour, ": ", e$message)
+        return(FALSE) 
+    })
+    if (!ggsave_status) {
+         panel_file <- file.path(plot_dir, sprintf("%s_mm_panel.png", tumour))
+         if(file.exists(panel_file) && file.info(panel_file)$size < 100) { # Minimal cleanup for empty files
+             
+         }
+    }
+  } else {
+     message("  Panel plot generation skipped for ", tumour, " (likely insufficient data or layout error).")
+  }
+
+  # Save updated data.table (with new cluster columns) back to original RDS file.
+  tryCatch({
+    saveRDS(dt, f)
+  }, error = function(e) {
+     warning("Failed to save updated RDS file '", f, "'. Error: ", e$message)
+  })
+} 
+
+# --- Write summary of all cut-points ---
+if (length(cut_list) > 0) {
+  summary_dt <- rbindlist(cut_list, use.names = TRUE, fill = TRUE)
+  tryCatch({
+     fwrite(summary_dt, summary_tsv, sep = "\t", na = "NA", quote=FALSE) 
+     message("\nCut-points summary saved -> ", summary_tsv)
+  }, error = function(e) {
+     warning("Failed to write summary TSV file '", summary_tsv, "'. Error: ", e$message)
+  })
+
+} else {
+   message("\nNo cut-points were generated for any tumor type.")
+}
+
+message("✅ Processing complete. Plots and updated tables saved in -> ", plot_dir)
