@@ -1,0 +1,84 @@
+
+setwd("C:/Users/victo/Documents")  
+
+
+if (!dir.exists("output_methylation")) {
+  dir.create("output_methylation")
+}
+
+
+library(data.table)
+library(ggplot2)
+
+meth_files <- list.files(
+  path       = "output",
+  pattern    = "_M_Analysis.*\\.rds$",
+  full.names = TRUE
+)
+
+if (length(meth_files) == 0) {
+  stop("No files matching '*_M_Analysis*.rds' found in ./output/")
+}
+
+# Loop through each methylation file 
+for (meth_path in meth_files) {
+
+  tumor <- sub("_M_Analysis.*\\.rds$", "", basename(meth_path))
+  message(sprintf("Processing methylation for: %s", tumor))
+
+  # Read M.Analysis results
+  m_analysis <- tryCatch({
+    readRDS(meth_path)
+  }, error = function(e) {
+    warning(sprintf("Failed to read %s: %s", meth_path, e$message))
+    return(NULL)
+  })
+  if (is.null(m_analysis)) next
+  setDT(m_analysis)
+
+  # Required CpG features
+  feats <- c("M.Island", "M.Shore", "M.Shelf", "M.OpenSea")
+  if (!all(feats %in% names(m_analysis))) {
+    warning(sprintf("%s: Missing one or more CpG feature columns. Skipping.", tumor))
+    next
+  }
+
+  # Melt to long format
+  long_dt <- melt(
+    m_analysis,
+    id.vars      = "bcr_patient_barcode",
+    measure.vars = feats,
+    variable.name= "Feature",
+    value.name   = "MeanBeta"
+  )
+  long_dt <- long_dt[!is.na(MeanBeta)]
+
+  # boxplot
+  p_meth <- ggplot(long_dt, aes(x = Feature, y = MeanBeta, fill = Feature)) +
+    geom_boxplot(outlier.size = 0.8) +
+    scale_y_continuous(limits = c(0, 1)) +
+    theme_bw() +
+    ggtitle(sprintf("%s: Avg. Methylation by Feature", tumor)) +
+    xlab("CpG Feature") +
+    ylab("Mean Beta Value") +
+    theme(
+      axis.text.x     = element_text(angle = 45, hjust = 1),
+      legend.position = "none",
+      plot.title      = element_text(hjust = 0.5),
+      panel.grid.major= element_line(color = "grey90")
+    )
+
+
+  out_file <- file.path(
+    "output_methylation",
+    sprintf("%s_avg_methylation_by_feature.png", tumor)
+  )
+  ggsave(
+    filename = out_file,
+    plot     = p_meth,
+    width    = 8,
+    height   = 6,
+    dpi      = 150
+  )
+  message(sprintf("Saved plot to: %s", out_file))
+}
