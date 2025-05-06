@@ -1,0 +1,120 @@
+
+input_dir  <- "output"       
+plot_dir   <- "output_age"   
+if (!dir.exists(plot_dir)) dir.create(plot_dir, recursive = TRUE)
+
+
+suppressPackageStartupMessages({
+  library(data.table)
+  library(ggplot2)
+})
+
+quick_load <- function(file) {
+  x <- readRDS(file)
+  if (!is.data.table(x)) setDT(x)
+  x[]
+}
+
+files <- dir(input_dir, pattern = "_patient_table\\.rds$", full.names = TRUE)
+if (!length(files)) stop("No *_patient_table.rds files found in ", input_dir)
+cat("Found", length(files), "patient tables.\n\n")
+
+
+for (f in files) {
+  tumour <- sub("_patient_table\\.rds$", "", basename(f))
+  cat("▶", tumour, "\n")
+
+  dt <- quick_load(f)
+
+  
+  age_col <- names(dt)[grepl("age", names(dt), ignore.case = TRUE) &
+                       grepl("diag", names(dt), ignore.case = TRUE)][1]
+  if (is.na(age_col)) { cat("   no age column – skipped.\n"); next }
+
+  dt[, age := suppressWarnings(as.numeric(
+       fifelse(get(age_col) %chin% c("[Not Available]","[Not Applicable]","[Unknown]"),
+               NA_character_, get(age_col))))]
+
+  # log10(Nmut)
+  if (!"Nmut" %in% names(dt)) { cat("  Nmut missing – skipped.\n"); next }
+  dt[, log10Nmut := fifelse(!is.na(Nmut) & Nmut >= 0,
+                            log10(as.numeric(Nmut)+1), NA_real_)]
+
+  # verify mutation groups 
+  if (!"Mutation_Load_Group" %in% names(dt) &&
+      all(c("Mut_Cluster","Nmut") %in% names(dt))) {
+    tmp <- dt[!is.na(Mut_Cluster) & !is.na(Nmut), .(mn = mean(Nmut)), by = Mut_Cluster]
+    if (nrow(tmp)) {
+      hyper <- tmp[which.max(mn), Mut_Cluster]
+      dt[, Mutation_Load_Group := ifelse(Mut_Cluster == hyper,
+                                         "Hypermutated", "NonHypermutated")]
+    }
+  }
+
+  # usable rows
+  ok <- dt[is.finite(age) & is.finite(log10Nmut)]
+  if (nrow(ok) < 10) { cat("  <10 samples – skipped.\n"); next }
+
+  
+  # OVERALL plot + stats
+  
+  cor_all <- cor.test(ok$age, ok$log10Nmut)
+  lab_all <- sprintf("r = %.2f, p = %.3g", cor_all$estimate, cor_all$p.value)
+
+  p_all <- ggplot(ok, aes(age, log10Nmut)) +
+           geom_point(alpha = .6) +
+           geom_smooth(method = "lm", se = TRUE, colour = "blue") +
+           theme_bw(base_size = 11) +
+           labs(x = "Age at Diagnosis", y = "log10(Nmut + 1)",
+                title = sprintf("%s: Age vs log10(Mutation Load) (overall)", tumour)) +
+           annotate("text", x = max(ok$age), y = max(ok$log10Nmut),
+                    hjust = 1, vjust = 1.1, colour = "blue", size = 3.5,
+                    label = lab_all)
+
+  ggsave(file.path(plot_dir, sprintf("%s_age_logNmut_overall.png", tumour)),
+         plot = p_all, width = 7, height = 5.5, dpi = 150)
+
+  
+  # 2) group‑split plot 
+  
+  if ("Mutation_Load_Group" %in% names(ok) &&
+      any(ok$Mutation_Load_Group %chin% c("Hypermutated","NonHypermutated"))) {
+
+    ok_grp <- ok[Mutation_Load_Group %chin% c("Hypermutated","NonHypermutated")]
+    ok_grp[, Mutation_Load_Group := factor(Mutation_Load_Group,
+                                           levels = c("Hypermutated","NonHypermutated"))]
+
+    ann <- ok_grp[ , { x<-cor.test(age, log10Nmut)
+                       .(lab = sprintf("%s: r=%.2f, p=%.3g",
+                                        Mutation_Load_Group[1], x$estimate, x$p.value)) },
+                   by = Mutation_Load_Group]
+
+    y_top <- max(ok_grp$log10Nmut)
+    x_top <- max(ok_grp$age)
+    y_step <- 0.12*diff(range(ok_grp$log10Nmut))
+
+    p_grp <- ggplot(ok_grp, aes(age, log10Nmut, colour = Mutation_Load_Group)) +
+             geom_point(alpha = .6) +
+             geom_smooth(method = "lm", se = TRUE) +
+             scale_colour_manual(values = c("Hypermutated" = "red",
+                                             "NonHypermutated" = "blue")) +
+             theme_bw(base_size = 11) +
+             labs(x = "Age at Diagnosis", y = "log10(Nmut + 1)",
+                  colour = "Mutation Group",
+                  title = sprintf("%s: Age vs log10(Mutation Load) by Group", tumour)) +
+             theme(legend.position = "bottom") +
+             annotate("text", x = x_top, y = y_top, hjust = 1, vjust = 1.1,
+                      colour = "red",  size = 3.5,
+                      label = ann[Mutation_Load_Group=="Hypermutated", lab]) +
+             annotate("text", x = x_top, y = y_top - y_step, hjust = 1, vjust = 1.1,
+                      colour = "blue", size = 3.5,
+                      label = ann[Mutation_Load_Group=="NonHypermutated", lab])
+
+    ggsave(file.path(plot_dir, sprintf("%s_age_logNmut_byGroup.png", tumour)),
+           plot = p_grp, width = 7, height = 5.5, dpi = 150)
+  }
+
+  cat("   ✔ saved plots to", plot_dir, "\n\n")
+}
+
+cat("All done!\n")
