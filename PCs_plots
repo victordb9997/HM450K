@@ -1,0 +1,58 @@
+
+setwd("C:/Users/victo/Documents")  
+
+if (!dir.exists("output_pca")) {
+  dir.create("output_pca")
+}
+
+
+library(data.table)
+library(ggplot2)
+library(scales)  
+
+
+pca_files <- list.files("output", pattern = "_PCA\\.rds$", full.names = TRUE)
+
+# Loop through each PCA file and plot variance explained for first 10 PCs
+for (pca_path in pca_files) {
+  
+  tumor <- sub("_PCA\\.rds$", "", basename(pca_path))
+  message("Plotting variance for: ", tumor)
+
+  
+  pca_obj <- readRDS(pca_path)
+  if (is.null(pca_obj$sdev)) {
+    warning(tumor, ": PCA object missing 'sdev'. Skipping.")
+    next
+  }
+
+  # Compute variance explained for first 10 PCs
+  sdev <- pca_obj$sdev
+  var_explained <- sdev^2 / sum(sdev^2)
+  nPC <- min(length(var_explained), 10)
+  var_explained <- var_explained[1:nPC]
+
+ 
+  df <- data.frame(
+    PC = factor(paste0("PC", seq_len(nPC)), levels = paste0("PC", seq_len(nPC))),
+    Variance = var_explained
+  )
+
+  # bar plot 
+  p_var <- ggplot(df, aes(x = PC, y = Variance)) +
+    geom_bar(stat = "identity", fill = "blue") +
+    theme_bw() +
+    scale_y_continuous(labels = percent_format(accuracy = 1)) +
+    ggtitle(paste(tumor, ": Variance Explained (First 10 PCs)")) +
+    xlab("Principal Component") +
+    ylab("Proportion of Variance") +
+    theme(
+      axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1),
+      plot.title = element_text(hjust = 0.5)
+    )
+
+  
+  out_file <- file.path("output_pca", paste0(tumor, "_variance_explained_top10.png"))
+  ggsave(filename = out_file, plot = p_var, width = 8, height = 6, dpi = 150)
+  message("Saved variance explained plot: ", out_file)
+}
