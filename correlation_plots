@@ -1,0 +1,384 @@
+
+base_dir <- "." 
+output_dir <- file.path(base_dir, "output") 
+output_corr_dir <- file.path(base_dir, "output-correlation") 
+
+
+if (!dir.exists(output_corr_dir)) {
+  dir.create(output_corr_dir, recursive = TRUE)
+  message("Created directory: ", output_corr_dir)
+}
+if (!dir.exists(output_dir)) {
+    stop("Input directory '", output_dir, "' not found. Please check the path or run previous scripts.")
+}
+
+
+library(data.table)
+library(corrplot)
+library(RColorBrewer) 
+
+# Manual Stars 
+star_cex <- 0.9            # Size of the stars 
+
+star_vertical_offset <- 0.25
+
+
+corr_cols_redpos <- colorRampPalette(c("blue", "white", "red"))(200)
+
+
+integrated_files <- list.files(output_dir, pattern = "_patient_table_integrated\\.rds$", full.names = TRUE)
+
+if (length(integrated_files) == 0) {
+    stop("No '*_patient_table_integrated.rds' files found in '", output_dir, "'.")
+}
+
+# add stars 
+
+add_manual_stars <- function(mat, p_mat, star_cex = 0.7, star_vertical_offset = 0.3, corrplot_args = list()) {
+  nr <- nrow(mat)
+  nc <- ncol(mat)
+
+  
+  plot_type <- ifelse(!is.null(corrplot_args$type), tolower(corrplot_args$type), "full")
+  
+  plot_diag_arg <- if (!is.null(corrplot_args$diag)) corrplot_args$diag else TRUE
+  plot_diag <- if (plot_type %in% c("upper", "lower")) plot_diag_arg else TRUE
+
+  
+  if(nrow(p_mat) != nr || ncol(p_mat) != nc){
+      warning("P-value matrix dimensions do not match correlation matrix dimensions. Skipping star plotting.")
+      return()
+  }
+
+  for (i in 1:nr) { 
+    for (j in 1:nc) { 
+
+        if (plot_type == "lower" && j > i) next
+       
+        if (plot_type == "upper" && j < i) next
+        
+        if (i == j && !plot_diag_arg) next
+       
+
+        p_val <- p_mat[i, j]
+
+        if (!is.na(p_val)) {
+            stars <- ""
+            if (p_val < 0.001) stars <- "***"
+            else if (p_val < 0.01) stars <- "**"
+            else if (p_val < 0.05) stars <- "*"
+
+            if (stars != "") {
+                
+                x_pos <- j
+                
+                y_pos <- (nr - i + 1) + star_vertical_offset
+
+                
+                text(x = x_pos,
+                     y = y_pos,
+                     labels = stars,
+                     cex = star_cex,
+                     col = "black", 
+                     
+                     adj = c(0.5, 0)
+                    )
+            }
+        }
+    }
+  }
+}
+
+
+
+for (file_path in integrated_files) {
+  tumor <- sub("^.*/(.*)_patient_table_integrated\\.rds$", "\\1", file_path)
+  message("Processing correlations for: ", tumor)
+
+  dt <- readRDS(file_path)
+  setDT(dt) 
+
+  # Define PCs and CpG features
+  pcs <- intersect(paste0("PC", 1:10), names(dt))
+  meth_features <- intersect(c("M.Mean", "M.Island", "M.Shore", "M.Shelf", "M.OpenSea"), names(dt))
+
+  # Prepare correlation data
+  dt_corr <- copy(dt)
+  # Convert gene columns to numeric (0/1)
+  gene_cols <- grep("^Gene:", names(dt_corr), value = TRUE)
+  valid_gene_cols <- character(0) 
+  if (length(gene_cols) > 0) {
+      for (gene in gene_cols) {
+          if (gene %in% names(dt_corr)) { 
+              vec <- dt_corr[[gene]]
+              
+              if(is.character(vec) || is.factor(vec) || is.logical(vec) || all(is.na(vec))) {
+                  
+                  dt_corr[, (gene) := as.numeric(!is.na(vec) & vec != "WT" & vec != "" & vec != FALSE)]
+                  valid_gene_cols <- c(valid_gene_cols, gene)
+              } else if (is.numeric(vec)) {
+                 
+                  valid_gene_cols <- c(valid_gene_cols, gene) 
+                  
+              } else {
+                  warning(tumor, ": Skipping conversion for non-standard column ", gene, " of type ", class(vec)[1])
+              }
+          } else {
+              warning(tumor, ": Gene column '", gene, "' not found in data.table during conversion prep.")
+          }
+      }
+  }
+
+  
+  mat1 <- NULL
+  p_mat1 <- NULL
+  mat2 <- NULL
+  p_mat2 <- NULL
+
+  # Heatmap 1: PCs vs Top 10 Mutated Genes 
+  mut_counts <- numeric(0)
+  if (length(valid_gene_cols) > 0) {
+      cols_for_counts <- intersect(valid_gene_cols, names(dt_corr))
+      if(length(cols_for_counts) > 0) {
+          
+          mut_counts <- sapply(dt_corr[, ..cols_for_counts], function(col) sum(col == 1, na.rm = TRUE))
+          mut_counts <- mut_counts[mut_counts >= 2] 
+      }
+  }
+
+  if (length(mut_counts) >= 1 && length(pcs) >= 1) {
+    top_genes_full <- names(sort(mut_counts, decreasing = TRUE))[1:min(10, length(mut_counts))]
+    valid_genes_for_corr <- intersect(top_genes_full, names(dt_corr))
+
+    if (length(valid_genes_for_corr) >= 1) {
+      vars1 <- c(pcs, valid_genes_for_corr)
+      vars1_present <- intersect(vars1, names(dt_corr))
+
+      
+      variance_check <- sapply(dt_corr[, ..vars1_present, with = FALSE], function(v) {
+          if(all(is.na(v))) return(0) 
+          var(v, na.rm = TRUE)
+      })
+      valid_vars1 <- vars1_present[which(variance_check > 1e-10)] 
+
+      if (length(valid_vars1) < 2) {
+          warning(tumor, ": Not enough variables with variance for PCs vs Genes correlation.")
+      } else {
+          valid_pcs_in_corr <- intersect(pcs, valid_vars1)
+          valid_genes_in_corr <- intersect(valid_genes_for_corr, valid_vars1)
+
+          if (length(valid_pcs_in_corr) < 1 || length(valid_genes_in_corr) < 1) {
+              warning(tumor, ": Not enough valid PCs or Genes remaining after variance check for heatmap.")
+          } else {
+              # Compute correlation matrix
+              cor_res <- cor(dt_corr[, ..valid_vars1, with = FALSE], use = "pairwise.complete.obs")
+              
+              mat1 <- cor_res[valid_genes_in_corr, valid_pcs_in_corr, drop = FALSE]
+
+             
+               if(!is.null(mat1) && is.matrix(mat1) && nrow(mat1) > 0 && ncol(mat1) > 0) {
+                   p_mat1 <- matrix(NA, nrow = nrow(mat1), ncol = ncol(mat1), dimnames = dimnames(mat1))
+                   for (i in 1:nrow(mat1)) {
+                       for (j in 1:ncol(mat1)) { 
+                           gene_name <- rownames(mat1)[i]
+                           pc_name <- colnames(mat1)[j]
+                           
+                           if(pc_name %in% names(dt_corr) && gene_name %in% names(dt_corr)){
+                               x <- dt_corr[[pc_name]]
+                               y <- dt_corr[[gene_name]]
+                               valid_pairs <- !is.na(x) & !is.na(y)
+                               
+                               if (sum(valid_pairs) >= 3 && var(x[valid_pairs], na.rm=TRUE) > 1e-10 && var(y[valid_pairs], na.rm=TRUE) > 1e-10) {
+                                   test_result <- tryCatch(cor.test(x, y, use = "pairwise.complete.obs", method="pearson"), error = function(e) NULL)
+                                   if (!is.null(test_result) && !is.na(test_result$p.value)) {
+                                       p_mat1[i, j] <- test_result$p.value
+                                   }
+                               }
+                           } else {
+                              warning("Column name mismatch during p-value calculation: ", pc_name, " or ", gene_name)
+                           }
+                       }
+                   }
+                   
+                   rownames(p_mat1) <- rownames(mat1)
+                   colnames(p_mat1) <- colnames(mat1)
+                   
+                   rownames(mat1) <- sub("^Gene:", "", rownames(mat1))
+                   rownames(p_mat1) <- sub("^Gene:", "", rownames(p_mat1))
+               } else {
+                    warning(tumor, ": Resulting correlation matrix 'mat1' is empty or invalid.")
+                    mat1 <- NULL 
+               }
+          }
+      }
+    } else {
+      warning(tumor, ": No valid top genes with >=2 mutations remaining after initial checks.")
+    }
+  } else {
+      if (length(pcs) < 1) warning(tumor, ": No PC columns (PC1:10) found in data.")
+      if (length(mut_counts) < 1 && length(valid_gene_cols) > 0) warning(tumor, ": No genes found with >= 2 mutations.")
+      if (length(valid_gene_cols) == 0 && length(gene_cols) > 0) warning(tumor, ": No gene columns were successfully converted to numeric.")
+  }
+
+  # Plotting Heatmap 1 (PCs vs Genes)
+  if (!is.null(mat1) && !is.null(p_mat1) && nrow(mat1) > 0 && ncol(mat1) > 0) { 
+      out1 <- file.path(output_corr_dir, paste0(tumor, "_PCs_vs_topGenes_corr_manualStars.png"))
+      png(filename = out1,
+          width = max(6, ncol(mat1) * 0.7 + 2.5), 
+          height = max(6, nrow(mat1) * 0.5 + 2.5), 
+          units = "in", res = 150)
+
+      
+      cp_args1 <- list(
+         method = "color",
+         type = "full", 
+         diag = TRUE,   
+         col = corr_cols_redpos,
+         addCoef.col = "black", 
+         number.cex = 0.6,     
+         tl.cex = 0.8,          
+         tl.col = "black",     
+         cl.lim = c(-1, 1),     
+         na.label = "NA",      
+         title = paste(tumor, ": PCs vs Top ", nrow(mat1), " Mutated Genes"),
+         mar = c(1, 1, 3.5, 1.5) 
+      )
+
+      # Plot heatmap WITHOUT stars 
+      corrplot(mat1,
+               method = cp_args1$method,
+               type = cp_args1$type,
+               diag = cp_args1$diag,
+               col = cp_args1$col,
+               addCoef.col = cp_args1$addCoef.col,
+               number.cex = cp_args1$number.cex,
+               tl.cex = cp_args1$tl.cex,
+               tl.col = cp_args1$tl.col,
+               cl.lim = cp_args1$cl.lim,
+               na.label = cp_args1$na.label,
+               
+               title = cp_args1$title,
+               mar = cp_args1$mar
+               )
+
+      # Add stars
+      add_manual_stars(mat = mat1, p_mat = p_mat1,
+                       star_cex = star_cex,
+                       star_vertical_offset = star_vertical_offset,
+                       corrplot_args = cp_args1) 
+
+      dev.off()
+      message("Saved PCs vs top genes heatmap (manual stars): ", out1)
+
+  } else {
+      warning(tumor, ": Skipping PCs vs Genes heatmap due to lack of valid correlation data or p-values.")
+  } 
+
+
+  # Heatmap 2: CpG Feature Correlations 
+  valid_feats <- intersect(meth_features, names(dt_corr))
+  valid_feats_var <- character(0)
+  if (length(valid_feats) > 0) {
+      
+      feat_vars <- sapply(dt_corr[, ..valid_feats, with = FALSE], function(v) {
+          if(all(is.na(v))) return(0)
+          var(v, na.rm = TRUE)
+      })
+      valid_feats_var <- valid_feats[which(feat_vars > 1e-10)]
+  }
+
+  if (length(valid_feats_var) >= 2) {
+    # Calculate correlation matrix for features with variance
+    mat2 <- cor(dt_corr[, ..valid_feats_var, with = FALSE], use = "pairwise.complete.obs")
+
+    # Calculate p-values for the feature correlation matrix
+    p_mat2 <- matrix(NA, nrow = length(valid_feats_var), ncol = length(valid_feats_var), dimnames = list(valid_feats_var, valid_feats_var))
+    for (i in 1:nrow(mat2)) {
+      for (j in 1:ncol(mat2)) {
+        
+        feat_i <- rownames(mat2)[i]
+        feat_j <- colnames(mat2)[j]
+        if (feat_i %in% names(dt_corr) && feat_j %in% names(dt_corr)){
+            x <- dt_corr[[feat_i]]
+            y <- dt_corr[[feat_j]]
+            valid_pairs <- !is.na(x) & !is.na(y)
+            
+            if (sum(valid_pairs) >= 3) {
+                test_result <- tryCatch(cor.test(x, y, use = "pairwise.complete.obs", method="pearson"), error = function(e) NULL)
+                if (!is.null(test_result) && !is.na(test_result$p.value)) {
+                    p_mat2[i, j] <- test_result$p.value
+                }
+            }
+        } else {
+            warning("Column name mismatch during p-value calculation for CpG features: ", feat_i, " or ", feat_j)
+        }
+      }
+    }
+
+    # Plotting Heatmap 2 (CpG Features)
+    if(!is.null(mat2) && !is.null(p_mat2) && nrow(mat2) > 0 && ncol(mat2) > 0){ 
+      out2 <- file.path(output_corr_dir, paste0(tumor, "_CpG_features_corr_manualStars.png"))
+      png(filename = out2,
+          width = max(5, ncol(mat2) * 0.8 + 2.5), 
+          height = max(5, nrow(mat2) * 0.8 + 2.5), 
+          units = "in", res = 150)
+
+      
+      cp_args2 <- list(
+          method = "color",
+          type = "upper",     
+          order = "hclust",   
+          diag = FALSE,       
+          col = corr_cols_redpos,
+          addCoef.col = "black",
+          number.cex = 0.7,
+          tl.cex = 0.9,      
+          tl.col = "black",
+          tl.srt = 45,        
+          cl.lim = c(-1, 1),
+          na.label = "NA",
+          title = paste(tumor, ": CpG Features Correlation"),
+          mar = c(1, 1, 3.5, 1.5) 
+      )
+
+      # Plot heatmap WITHOUT stars
+      corrplot(mat2,
+               method = cp_args2$method,
+               type = cp_args2$type,
+               order = cp_args2$order,
+               diag = cp_args2$diag,
+               col = cp_args2$col,
+               addCoef.col = cp_args2$addCoef.col,
+               number.cex = cp_args2$number.cex,
+               tl.cex = cp_args2$tl.cex,
+               tl.col = cp_args2$tl.col,
+               tl.srt = cp_args2$tl.srt,
+               cl.lim = cp_args2$cl.lim,
+               na.label = cp_args2$na.label,
+               
+               title = cp_args2$title,
+               mar = cp_args2$mar
+               )
+
+      # Add stars 
+      add_manual_stars(mat = mat2, p_mat = p_mat2,
+                       star_cex = star_cex,
+                       star_vertical_offset = star_vertical_offset,
+                       corrplot_args = cp_args2) 
+
+      dev.off()
+      message("Saved CpG features heatmap (manual stars): ", out2)
+    } else {
+      warning(tumor, ": Skipping CpG heatmap due to lack of valid correlation data or p-values.")
+    }
+
+  } else {
+    warning(tumor, ": Not enough CpG features (>=2) with variance for correlation heatmap.")
+  }
+
+ 
+  rm(dt, dt_corr, mat1, p_mat1, mat2, p_mat2, cp_args1, cp_args2, mut_counts, valid_gene_cols)
+  gc() 
+} 
+
+message("Correlation processing complete.")
